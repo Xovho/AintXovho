@@ -1,15 +1,16 @@
+-- // Main.lua for Brainrot Automation1
+
 -- ====== Services ======
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 local Humanoid = LocalPlayer.Character:WaitForChild("Humanoid")
 local VirtualUser = game:GetService("VirtualUser")
+local HttpService = game:GetService("HttpService")
 
 -- ====== Config ======
 local Config = getgenv().sabConfig
 
--- Remote
 local remote = ReplicatedStorage:WaitForChild("BridgeNet2").dataRemoteEvent
 
 -- ====== Utility Functions ======
@@ -17,17 +18,12 @@ local function CleanName(toolName)
     return toolName:gsub("%[.-%]%s*", "")
 end
 
-local function ParseMoney(text)
-    local clean = text:gsub("[%$,()%s/s]", "")
-    return tonumber(clean) or 0
-end
-
 local function ShouldSell(item)
     if not item then return false end
-    for _, blockedName in ipairs(Config.BlockNames) do
+    for _, blockedName in ipairs(Config.BlockNames or {}) do
         if item.Title == blockedName then return false end
     end
-    if ParseMoney(item.Money or "0") >= Config.DontSellAbovePerSec then
+    if tonumber(item.Money and item.Money:match("%d+%.?%d*")) and tonumber(item.Money:match("%d+%.?%d*")) >= (Config.DontSellAbovePerSec or 1000) then
         return false
     end
     return true
@@ -42,6 +38,7 @@ local function GetItemData(brainrotModel)
             if ui then
                 local data = {
                     Title = ui:FindFirstChild("Title") and ui.Title.Text or "",
+                    Weight = ui:FindFirstChild("Weight") and ui.Weight.Text or "",
                     Money = ui:FindFirstChild("Money") and ui.Money.Text or "($0/s)"
                 }
                 if data.Title ~= "" then
@@ -56,7 +53,7 @@ end
 local function WaitForToolModel(toolName, brainrotName)
     local playerWorkspace = workspace:WaitForChild("Players"):WaitForChild(LocalPlayer.Name)
     local model
-    local timeout = tick() + Config.ModelWaitMax
+    local timeout = tick() + (Config.ModelWaitMax or 2)
     repeat
         model = playerWorkspace:FindFirstChild(toolName)
         if model and model:FindFirstChild(brainrotName) then
@@ -73,27 +70,31 @@ local function SellTool(tool)
 
     local brainrotName = CleanName(tool.Name)
 
+    -- Equip if in Backpack
     if tool.Parent == LocalPlayer.Backpack then
         Humanoid:EquipTool(tool)
-        task.wait(Config.EquipWait)
+        task.wait(Config.EquipWait or 0.5)
     end
 
+    -- Wait for model
     local toolModel = WaitForToolModel(tool.Name, brainrotName)
     if not toolModel then
         warn("Skipped tool (model not found):", tool.Name)
         return
     end
 
+    -- Get data
     local itemData = GetItemData(toolModel)
     if not itemData or not ShouldSell(itemData) then
         warn("Skipped tool (did not pass filter):", tool.Name, itemData and itemData.Title)
         return
     end
 
+    -- Sell
     if ReplicatedStorage.Remotes:FindFirstChild("ItemSell") then
         ReplicatedStorage.Remotes.ItemSell:FireServer(true)
         print("Sold:", itemData.Title, "perSec:", itemData.Money)
-        task.wait(Config.SellDelay)
+        task.wait(Config.SellDelay or 0.5)
     end
 end
 
@@ -103,21 +104,37 @@ Players.LocalPlayer.Idled:Connect(function()
     VirtualUser:ClickButton2(Vector2.new())
 end)
 
--- ====== Auto-Buy ======
+-- ====== Auto-Buy Loop ======
 task.spawn(function()
     while Config.AutoBuyEnabled do
         task.wait(Config.BuyDelay or 0.3)
-        for _, data in ipairs(Config.Items) do
+        for _, data in ipairs(Config.Items or {}) do
             for i = 1, Config.MaxPerItem or 10 do
                 local args = { { data[1], data[2] } }
                 remote:FireServer(unpack(args))
-                task.wait(0.1)
+                task.wait(Config.BuyDelay or 0.3)
             end
         end
     end
 end)
 
--- ====== Webhook ======
+-- ====== Auto-Sell Loop ======
+task.spawn(function()
+    while true do
+        for _, tool in ipairs(LocalPlayer.Backpack:GetChildren()) do
+            SellTool(tool)
+        end
+        local playerWorkspace = workspace:FindFirstChild("Players") and workspace.Players:FindFirstChild(LocalPlayer.Name)
+        if playerWorkspace then
+            for _, tool in ipairs(playerWorkspace:GetChildren()) do
+                SellTool(tool)
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- ====== Discord Webhook ======
 task.spawn(function()
     local requestFunc = request or http_request or (syn and syn.request)
     if not requestFunc then
@@ -134,19 +151,20 @@ task.spawn(function()
         if backpack then
             for _, item in ipairs(backpack:GetChildren()) do
                 if item:IsA("Tool") and item:GetAttribute("Brainrot") then
-                    local gen = ""      
-                    local title = item.Name
                     local part = item:FindFirstChild("RootPart") or item:FindFirstChild("HumanoidRootPart")
                     if part and part:FindFirstChild("BrainrotToolUI") then
                         local ui = part.BrainrotToolUI
-                        title = (ui:FindFirstChild("Title") and ui.Title.Text) or title
-                        gen = (ui:FindFirstChild("Money") and ui.Money.Text) or ""
+                        local title = (ui:FindFirstChild("Title") and ui.Title.Text) or item.Name
+                        local weight = (ui:FindFirstChild("Weight") and ui.Weight.Text) or ""
+                        local gen = (ui:FindFirstChild("Money") and ui.Money.Text) or "($0/s)"
+
+                        table.insert(brainrotItems, string.format("%s %s  %s", weight, title, gen))
                     end
-                    table.insert(brainrotItems, string.format("%s %s", gen, title))
                 end
             end
         end
 
+        -- Player Money
         local money = 0
         local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
         if leaderstats and leaderstats:FindFirstChild("Money") then
@@ -169,8 +187,9 @@ task.spawn(function()
 
         local moneyStr = FormatMoney(money)
 
+        -- Build report
         local report = "Brainrot Inventory Report for " .. LocalPlayer.Name .. "\n"
-        report = report .. "Money: " .. moneyStr .. "\n"
+        report = report .. "Money: " .. moneyStr .. "\n\n"
         report = report .. "Inventory (" .. #brainrotItems .. " items):\n"
         for i, itemStr in ipairs(brainrotItems) do
             report = report .. i .. ". " .. itemStr .. "\n"
@@ -178,6 +197,7 @@ task.spawn(function()
 
         local content = "```" .. report .. "```"
 
+        -- Send webhook
         pcall(function()
             requestFunc({
                 Url = Config.WEBHOOK_URL,
@@ -188,21 +208,5 @@ task.spawn(function()
         end)
 
         print("Webhook sent! Money:", moneyStr, "Items:", #brainrotItems)
-    end
-end)
-
--- ====== Auto-Sell Loop ======
-task.spawn(function()
-    while true do
-        for _, tool in ipairs(LocalPlayer.Backpack:GetChildren()) do
-            SellTool(tool)
-        end
-        local playerWorkspace = workspace:FindFirstChild("Players") and workspace.Players:FindFirstChild(LocalPlayer.Name)
-        if playerWorkspace then
-            for _, tool in ipairs(playerWorkspace:GetChildren()) do
-                SellTool(tool)
-            end
-        end
-        task.wait(1)
     end
 end)
